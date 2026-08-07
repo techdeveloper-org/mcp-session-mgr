@@ -20,6 +20,7 @@ import string
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Annotated
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -32,6 +33,8 @@ try:
     from mcp.server.mcpserver import MCPServer
 except ImportError:  # mcp < 2.0
     from mcp.server.fastmcp import FastMCP as MCPServer
+from mcp.types import ToolAnnotations
+from pydantic import Field
 from base.decorators import mcp_tool_handler
 from base.persistence import AtomicJsonStore
 
@@ -61,11 +64,83 @@ _TECH_KEYWORDS = [
 ]
 
 
+# Read-only annotation reused by every tool that only inspects stored sessions.
+_READ_ONLY = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+
+
+class _SessionNotFoundError(LookupError):
+    """Raised inside a chain-index mutator when the target session is absent.
+
+    Caught immediately after the ``modify()`` call by the owning tool and
+    translated into that tool's existing ``{"success": False, ...}`` shape.
+    Never propagates past its own tool function.
+    """
+
+
+class _WorkItemNotFoundError(LookupError):
+    """Raised inside a chain-index mutator when the target work item is absent.
+
+    Caught immediately after the ``modify()`` call by the owning tool and
+    translated into that tool's existing ``{"success": False, ...}`` shape.
+    """
+
+
+class _NoAccumulatedDataError(LookupError):
+    """Raised inside the finalize mutator when a session has no accumulated data.
+
+    Caught immediately after the ``modify()`` call and translated into the
+    tool's existing ``{"success": False, ...}`` shape.
+    """
+
+
+def _safe_component(value: str, field_name: str) -> str:
+    """Validate a caller-supplied string that becomes a single path component.
+
+    Session and project names are interpolated directly into filesystem paths.
+    Without this check a value such as '../../..' or an absolute path would let
+    a tool call read or write outside the session storage tree.
+
+    Args:
+        value: Caller-supplied name.
+        field_name: Parameter name, used in the error message.
+
+    Returns:
+        The validated value unchanged.
+
+    Raises:
+        ValueError: If the value is empty, contains a path separator, a null
+            byte, a drive letter, or resolves to a parent-directory reference.
+    """
+    if not value:
+        raise ValueError(f"{field_name} must not be empty")
+    if value in (".", ".."):
+        raise ValueError(f"{field_name} must not be a directory reference")
+    if "\x00" in value:
+        raise ValueError(f"{field_name} must not contain null bytes")
+    if "/" in value or "\\" in value or ":" in value:
+        raise ValueError(
+            f"{field_name} must be a single name, not a path "
+            f"(got {value!r})"
+        )
+    return value
+
+
 def _ensure_dirs(project: str = None):
-    """Ensure session directories exist."""
+    """Ensure session directories exist.
+
+    Args:
+        project: Optional project name. Validated as a single path component
+            before a directory is created for it.
+    """
     SESSIONS_PATH.mkdir(parents=True, exist_ok=True)
     STATE_PATH.mkdir(parents=True, exist_ok=True)
     if project:
+        _safe_component(project, "project")
         (SESSIONS_PATH / project).mkdir(parents=True, exist_ok=True)
 
 
@@ -111,6 +186,26 @@ def safe_load_session(session_file):
     }
 
 
+def _atomic_write(file_path: Path, content: str) -> None:
+    """Write text to a file via temp-then-rename so no reader sees a partial file.
+
+    The temp file name appends '.tmp' rather than replacing the existing
+    suffix, so a session id containing a dot cannot make two concurrent writes
+    collide on the same temp path.
+
+    Note: this guarantees readers never observe a half-written file. It does not
+    serialize two independent writers - the later rename still wins outright.
+
+    Args:
+        file_path: Destination path.
+        content: Text to write, UTF-8 encoded.
+    """
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = file_path.with_name(file_path.name + ".tmp")
+    temp_path.write_text(content, encoding="utf-8")
+    temp_path.replace(file_path)
+
+
 def _extract_tags(prompt: str, task_type: str = "", skill: str = "",
                   project_cwd: str = "") -> list:
     """Auto-extract tags from prompt and metadata."""
@@ -130,13 +225,22 @@ def _extract_tags(prompt: str, task_type: str = "", skill: str = "",
     return sorted(tags)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=True, openWorldHint=False))
 @mcp_tool_handler
 def session_save(
-    session_id: str,
-    data_type: str,
-    content: str,
-    project: str = "default"
+    session_id: Annotated[str, Field(
+        description="Session identifier the data belongs to. Must be a single "
+                    "name, not a path.")],
+    data_type: Annotated[str, Field(
+        description="Which artifact to write: 'summary' (markdown), 'state' "
+                    "(per-project JSON), or 'context' (JSON snapshot).")],
+    content: Annotated[str, Field(
+        description="Payload to persist. Markdown for 'summary'; a JSON string "
+                    "for 'state' and 'context'.")],
+    project: Annotated[str, Field(
+        description="Project name used to group sessions on disk. Must be a single directory name, not a path.")] = "default",
 ) -> dict:
     """Save session data to disk atomically.
 
@@ -146,6 +250,8 @@ def session_save(
         content: Content to save (markdown or JSON string)
         project: Project name for organizing sessions
     """
+    _safe_component(project, "project")
+    _safe_component(session_id, "session_id")
     _ensure_dirs(project)
 
     if data_type == "state":
@@ -157,25 +263,19 @@ def session_save(
         except (json.JSONDecodeError, TypeError):
             data = {"content": content, "updated_at": datetime.now().isoformat()}
 
-        # Atomic write: write to temp then rename
-        temp_path = file_path.with_suffix(".tmp")
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, default=str)
-        temp_path.replace(file_path)
+        _atomic_write(file_path, json.dumps(data, indent=2, default=str))
 
     elif data_type == "summary":
-        # Session summaries go to sessions/{project}/
+        # Session summaries go to sessions/{project}/. Written through the same
+        # temp-then-rename path as the other types; a plain truncating write
+        # leaves a half-written summary behind if it is interrupted.
         file_path = SESSIONS_PATH / project / f"session-{session_id}.md"
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        _atomic_write(file_path, content)
 
     elif data_type == "context":
         # Context snapshots
         file_path = SESSIONS_PATH / project / f"context-{session_id}.json"
-        temp_path = file_path.with_suffix(".tmp")
-        with open(temp_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        temp_path.replace(file_path)
+        _atomic_write(file_path, content)
 
     else:
         return {"success": False, "error": f"Unknown data_type: {data_type}"}
@@ -189,12 +289,17 @@ def session_save(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
 def session_load(
-    session_id: str = "",
-    data_type: str = "state",
-    project: str = "default"
+    session_id: Annotated[str, Field(
+        description="Session identifier to load. Leave empty with "
+                    "data_type='summary' to load the most recent session.")] = "",
+    data_type: Annotated[str, Field(
+        description="Which artifact to read: 'summary', 'state', or "
+                    "'context'.")] = "state",
+    project: Annotated[str, Field(
+        description="Project name used to group sessions on disk. Must be a single directory name, not a path.")] = "default",
 ) -> dict:
     """Load session data from disk.
 
@@ -203,6 +308,10 @@ def session_load(
         data_type: 'summary', 'state', or 'context'
         project: Project name
     """
+    _safe_component(project, "project")
+    if session_id:
+        _safe_component(session_id, "session_id")
+
     if data_type == "state":
         file_path = STATE_PATH / f"{project}.json"
         if not file_path.exists():
@@ -211,8 +320,9 @@ def session_load(
                 "data": {},
                 "message": "No state file found"
             }
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        # Recovers from a corrupt primary file via its .bak backup instead of
+        # raising, matching the corruption handling the context branch uses.
+        data = safe_load_session(file_path)
         return {"success": True, "data": data, "file": str(file_path)}
 
     elif data_type == "summary":
@@ -235,41 +345,62 @@ def session_load(
         return {"success": True, "data": content, "file": str(file_path)}
 
     elif data_type == "context":
+        if not session_id:
+            return {"success": False, "error": "session_id is required for data_type 'context'"}
         file_path = SESSIONS_PATH / project / f"context-{session_id}.json"
         if not file_path.exists():
             return {"success": False, "error": f"Context not found: {session_id}"}
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = safe_load_session(file_path)
         return {"success": True, "data": data, "file": str(file_path)}
 
     else:
         return {"success": False, "error": f"Unknown data_type: {data_type}"}
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
-def session_list(project: str = "", limit: int = 20) -> dict:
+def session_list(
+    project: Annotated[str, Field(
+        description="Restrict to one project. Empty lists every project.")] = "",
+    limit: Annotated[int, Field(
+        ge=1, le=500,
+        description="Maximum sessions to return. Results are sorted by "
+                    "modification time descending before this bound is "
+                    "applied; the response reports total_matched and "
+                    "truncated.")] = 20,
+) -> dict:
     """List available sessions.
 
     Args:
         project: Filter by project name (empty = all projects)
         limit: Maximum number of sessions to return
     """
-    sessions = []
-
     if project:
+        _safe_component(project, "project")
         project_dirs = [SESSIONS_PATH / project]
     else:
         if not SESSIONS_PATH.exists():
-            return {"success": True, "sessions": [], "count": 0}
+            return {"success": True, "sessions": [], "count": 0, "total_matched": 0,
+                    "truncated": False}
         project_dirs = [d for d in SESSIONS_PATH.iterdir() if d.is_dir()]
 
+    # Collect every candidate before bounding. The previous implementation
+    # stopped collecting as soon as `limit` rows had been gathered in raw
+    # directory-iteration order, and only sorted by modification time
+    # afterwards. With more than `limit` sessions in the first project scanned,
+    # no session from any later project could ever appear - even when those
+    # were the most recently modified - and nothing in the response indicated
+    # that results had been dropped.
+    sessions = []
     for proj_dir in project_dirs:
         if not proj_dir.exists():
             continue
         proj_name = proj_dir.name
-        for session_file in sorted(proj_dir.glob("session-*.md"), reverse=True):
-            stat = session_file.stat()
+        for session_file in proj_dir.glob("session-*.md"):
+            try:
+                stat = session_file.stat()
+            except OSError:
+                continue
             sessions.append({
                 "project": proj_name,
                 "session_id": session_file.stem.replace("session-", ""),
@@ -277,65 +408,95 @@ def session_list(project: str = "", limit: int = 20) -> dict:
                 "size_bytes": stat.st_size,
                 "modified": datetime.fromtimestamp(stat.st_mtime).isoformat()
             })
-            if len(sessions) >= limit:
-                break
 
-    # Sort by modified time descending
+    total_matched = len(sessions)
     sessions.sort(key=lambda s: s["modified"], reverse=True)
     sessions = sessions[:limit]
 
     return {
         "success": True,
         "sessions": sessions,
-        "count": len(sessions)
+        "count": len(sessions),
+        "total_matched": total_matched,
+        "truncated": total_matched > len(sessions),
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True,
+    idempotentHint=False, openWorldHint=False))
 @mcp_tool_handler
-def session_archive(days_old: int = 30) -> dict:
+def session_archive(
+    days_old: Annotated[int, Field(
+        ge=1,
+        description="Archive sessions whose last modification is older than "
+                    "this many days. Files are moved into sessions/_archived/, "
+                    "not deleted.")] = 30,
+) -> dict:
     """Archive sessions older than specified days.
 
     Args:
         days_old: Archive sessions older than this many days (default: 30)
     """
+    if not SESSIONS_PATH.exists():
+        return {"success": True, "archived": [], "count": 0, "failed": []}
+
     cutoff = datetime.now() - timedelta(days=days_old)
     archived = []
+    failed = []
     archive_dir = SESSIONS_PATH / "_archived"
     archive_dir.mkdir(parents=True, exist_ok=True)
-
-    if not SESSIONS_PATH.exists():
-        return {"success": True, "archived": [], "count": 0}
 
     for proj_dir in SESSIONS_PATH.iterdir():
         if not proj_dir.is_dir() or proj_dir.name.startswith("_"):
             continue
 
         for session_file in proj_dir.glob("session-*.md"):
-            file_mtime = datetime.fromtimestamp(session_file.stat().st_mtime)
-            if file_mtime < cutoff:
-                # Move to archive
-                dest_dir = archive_dir / proj_dir.name
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                dest = dest_dir / session_file.name
+            try:
+                file_mtime = datetime.fromtimestamp(session_file.stat().st_mtime)
+            except OSError as e:
+                failed.append({"file": session_file.name, "project": proj_dir.name,
+                               "error": str(e)[:150]})
+                continue
+            if file_mtime >= cutoff:
+                continue
+
+            dest_dir = archive_dir / proj_dir.name
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / session_file.name
+            # A failed move must be reported: silently skipping it would make
+            # the response claim a clean archive run while files stayed behind.
+            try:
                 shutil.move(str(session_file), str(dest))
-                archived.append({
-                    "file": session_file.name,
-                    "project": proj_dir.name,
-                    "age_days": (datetime.now() - file_mtime).days
-                })
+            except (OSError, shutil.Error) as e:
+                failed.append({"file": session_file.name, "project": proj_dir.name,
+                               "error": str(e)[:150]})
+                continue
+            archived.append({
+                "file": session_file.name,
+                "project": proj_dir.name,
+                "age_days": (datetime.now() - file_mtime).days
+            })
 
     return {
-        "success": True,
+        "success": not failed,
         "archived": archived,
         "count": len(archived),
+        "failed": failed,
+        "failed_count": len(failed),
         "archive_dir": str(archive_dir)
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
-def session_query(filters: str = "{}") -> dict:
+def session_query(
+    filters: Annotated[str, Field(
+        description="JSON object string of filter criteria. Keys: project "
+                    "(single name), date_from and date_to (ISO 8601), keyword "
+                    "(case-insensitive full-text match), limit (positive "
+                    "integer, default 50).")] = "{}",
+) -> dict:
     """Query sessions with filters.
 
     Args:
@@ -349,42 +510,60 @@ def session_query(filters: str = "{}") -> dict:
         return {"success": False, "error": "Invalid JSON in filters parameter"}
 
     project_filter = filter_dict.get("project", "")
-    date_from = filter_dict.get("date_from", "")
-    date_to = filter_dict.get("date_to", "")
     keyword = filter_dict.get("keyword", "").lower()
+    limit = filter_dict.get("limit", 50)
+    if not isinstance(limit, int) or limit < 1:
+        return {"success": False, "error": "filters.limit must be a positive integer"}
 
-    results = []
+    # Parse date bounds once, up front, so a malformed date is reported as a
+    # clear input error rather than raised from inside the scan loop.
+    bounds = {}
+    for key in ("date_from", "date_to"):
+        raw = filter_dict.get(key, "")
+        if not raw:
+            continue
+        try:
+            bounds[key] = datetime.fromisoformat(raw)
+        except (TypeError, ValueError):
+            return {"success": False,
+                    "error": f"filters.{key} is not a valid ISO 8601 datetime: {raw!r}"}
 
     if not SESSIONS_PATH.exists():
-        return {"success": True, "results": [], "count": 0}
+        return {"success": True, "results": [], "count": 0, "total_matched": 0,
+                "truncated": False, "filters": filter_dict}
 
     if project_filter:
+        _safe_component(project_filter, "filters.project")
         project_dirs = [SESSIONS_PATH / project_filter]
     else:
         project_dirs = [d for d in SESSIONS_PATH.iterdir() if d.is_dir() and not d.name.startswith("_")]
 
+    # Filter the full candidate set first, then sort, then bound. The previous
+    # implementation stopped at 50 rows mid-scan in raw directory order, so
+    # later project directories were starved of their matches and the retained
+    # 50 were an arbitrary subset rather than the most recent ones.
+    results = []
     for proj_dir in project_dirs:
         if not proj_dir.exists():
             continue
 
-        for session_file in sorted(proj_dir.glob("session-*.md"), reverse=True):
-            stat = session_file.stat()
+        for session_file in proj_dir.glob("session-*.md"):
+            try:
+                stat = session_file.stat()
+            except OSError:
+                continue
             file_date = datetime.fromtimestamp(stat.st_mtime)
 
-            # Date filters
-            if date_from:
-                from_dt = datetime.fromisoformat(date_from)
-                if file_date < from_dt:
-                    continue
-            if date_to:
-                to_dt = datetime.fromisoformat(date_to)
-                if file_date > to_dt:
-                    continue
+            if "date_from" in bounds and file_date < bounds["date_from"]:
+                continue
+            if "date_to" in bounds and file_date > bounds["date_to"]:
+                continue
 
-            # Keyword filter
             if keyword:
-                with open(session_file, "r", encoding="utf-8") as f:
-                    content = f.read().lower()
+                try:
+                    content = session_file.read_text(encoding="utf-8", errors="ignore").lower()
+                except OSError:
+                    continue
                 if keyword not in content:
                     continue
 
@@ -396,25 +575,40 @@ def session_query(filters: str = "{}") -> dict:
                 "size_bytes": stat.st_size
             })
 
-            if len(results) >= 50:
-                break
+    total_matched = len(results)
+    results.sort(key=lambda r: r["modified"], reverse=True)
+    results = results[:limit]
 
     return {
         "success": True,
         "results": results,
         "count": len(results),
+        "total_matched": total_matched,
+        "truncated": total_matched > len(results),
         "filters": filter_dict
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=False, openWorldHint=False))
 @mcp_tool_handler
 def session_create(
-    project: str = "default",
-    task_type: str = "",
-    skill: str = "",
-    prompt: str = "",
-    project_cwd: str = ""
+    project: Annotated[str, Field(
+        description="Project name used to group sessions on disk. Must be a single directory name, not a path.")] = "default",
+    task_type: Annotated[str, Field(
+        description="Classification of the work, e.g. 'Implementation' or "
+                    "'Bug Fix'. Recorded as a tag.")] = "",
+    skill: Annotated[str, Field(
+        description="Primary skill in use for this session. Recorded as a "
+                    "tag.")] = "",
+    prompt: Annotated[str, Field(
+        description="User prompt text. Scanned for known technology keywords "
+                    "to auto-extract tags; the first 200 characters are "
+                    "retained.")] = "",
+    project_cwd: Annotated[str, Field(
+        description="Working directory path. Its final segment becomes a "
+                    "project tag.")] = "",
 ) -> dict:
     """Create a new session with unique ID and register it in the chain index.
 
@@ -434,29 +628,36 @@ def session_create(
     # Auto-extract tags
     tags = _extract_tags(prompt, task_type, skill, project_cwd)
 
-    # Register in chain index
-    index = _chain_store.load()
-    index["sessions"][session_id] = {
-        "parent": None,
-        "children": [],
-        "related": [],
-        "tags": tags,
-        "project": project,
-        "skill": skill,
-        "task_type": task_type,
-        "summary": "",
-        "created_at": now.isoformat(),
-        "last_prompt": prompt[:200] if prompt else ""
-    }
+    def _register_session(index: dict) -> None:
+        """Insert the new session record and merge it into the tag index.
 
-    # Update tag index
-    for tag in tags:
-        if tag not in index["tag_index"]:
-            index["tag_index"][tag] = []
-        if session_id not in index["tag_index"][tag]:
-            index["tag_index"][tag].append(session_id)
+        ``session_id``, ``tags`` and ``now`` are generated once above, before
+        the retryable cycle starts, so every retry of this same logical
+        create call registers the identical session id rather than a
+        different one per attempt. The tag-index merge itself must be
+        recomputed from ``index`` on every attempt: another writer's tags
+        for unrelated sessions may have landed between attempts and must not
+        be discarded.
+        """
+        index.setdefault("sessions", {})[session_id] = {
+            "parent": None,
+            "children": [],
+            "related": [],
+            "tags": tags,
+            "project": project,
+            "skill": skill,
+            "task_type": task_type,
+            "summary": "",
+            "created_at": now.isoformat(),
+            "last_prompt": prompt[:200] if prompt else ""
+        }
+        tag_index = index.setdefault("tag_index", {})
+        for tag in tags:
+            bucket = tag_index.setdefault(tag, [])
+            if session_id not in bucket:
+                bucket.append(session_id)
 
-    _chain_store.save(index)
+    _chain_store.modify(_register_session)
 
     # Update current session pointer
     CURRENT_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -477,11 +678,16 @@ def session_create(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=True, openWorldHint=False))
 @mcp_tool_handler
 def session_link(
-    child_id: str,
-    parent_id: str
+    child_id: Annotated[str, Field(
+        description="Session that continues the parent, typically a new "
+                    "session created after /clear.")],
+    parent_id: Annotated[str, Field(
+        description="Preceding session that the child continues from.")],
 ) -> dict:
     """Link a child session to its parent (for /clear continuity).
 
@@ -489,29 +695,41 @@ def session_link(
         child_id: New session ID (child)
         parent_id: Previous session ID (parent)
     """
-    index = _chain_store.load()
+    now_iso = datetime.now().isoformat()
 
-    if parent_id not in index["sessions"]:
-        index["sessions"][parent_id] = {
-            "parent": None, "children": [], "related": [],
-            "tags": [], "project": "", "skill": "", "task_type": "",
-            "summary": "", "created_at": "", "last_prompt": ""
-        }
+    def _link(index: dict) -> None:
+        """Create any missing parent/child records and link them.
 
-    if child_id not in index["sessions"]:
-        index["sessions"][child_id] = {
-            "parent": parent_id, "children": [], "related": [],
-            "tags": [], "project": "", "skill": "", "task_type": "",
-            "summary": "", "created_at": datetime.now().isoformat(),
-            "last_prompt": ""
-        }
-    else:
-        index["sessions"][child_id]["parent"] = parent_id
+        ``now_iso`` is generated once above so a child record created on a
+        retried attempt keeps the same ``created_at`` as the intent that
+        triggered this call, rather than a later retry's clock reading.
+        Membership checks against ``index`` must be redone on every attempt:
+        a concurrent ``session_create`` or ``session_tag`` call may have
+        added either record between attempts.
+        """
+        sessions = index.setdefault("sessions", {})
 
-    if child_id not in index["sessions"][parent_id]["children"]:
-        index["sessions"][parent_id]["children"].append(child_id)
+        if parent_id not in sessions:
+            sessions[parent_id] = {
+                "parent": None, "children": [], "related": [],
+                "tags": [], "project": "", "skill": "", "task_type": "",
+                "summary": "", "created_at": "", "last_prompt": ""
+            }
 
-    _chain_store.save(index)
+        if child_id not in sessions:
+            sessions[child_id] = {
+                "parent": parent_id, "children": [], "related": [],
+                "tags": [], "project": "", "skill": "", "task_type": "",
+                "summary": "", "created_at": now_iso,
+                "last_prompt": ""
+            }
+        else:
+            sessions[child_id]["parent"] = parent_id
+
+        if child_id not in sessions[parent_id]["children"]:
+            sessions[parent_id]["children"].append(child_id)
+
+    _chain_store.modify(_link)
 
     return {
         "success": True,
@@ -521,12 +739,18 @@ def session_link(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=True, openWorldHint=False))
 @mcp_tool_handler
 def session_tag(
-    session_id: str,
-    tags: str,
-    summary: str = ""
+    session_id: Annotated[str, Field(
+        description="Session to tag. Created in the chain index if absent.")],
+    tags: Annotated[str, Field(
+        description="Comma-separated tags, e.g. 'spring-boot,docker'. Merged "
+                    "with any existing tags.")],
+    summary: Annotated[str, Field(
+        description="Optional summary text stored on the session.")] = "",
 ) -> dict:
     """Add tags and optional summary to a session. Auto-relates by shared tags.
 
@@ -535,62 +759,86 @@ def session_tag(
         tags: Comma-separated tag list (e.g., 'spring-boot,docker,scheduler')
         summary: Optional session summary text
     """
-    index = _chain_store.load()
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    now_iso = datetime.now().isoformat()
 
-    if session_id not in index["sessions"]:
-        index["sessions"][session_id] = {
-            "parent": None, "children": [], "related": [],
-            "tags": [], "project": "", "skill": "", "task_type": "",
-            "summary": "", "created_at": datetime.now().isoformat(),
-            "last_prompt": ""
-        }
+    def _tag_session(index: dict) -> None:
+        """Merge tags, the tag index, and shared-tag auto-relations.
 
-    session = index["sessions"][session_id]
-    existing_tags = set(session.get("tags", []))
-    new_tags = existing_tags | set(tag_list)
-    session["tags"] = sorted(new_tags)
+        Every value this mutator needs -- the session's existing tags, the
+        tag index, and every other session's tags for the auto-relate scan
+        -- must be read fresh from ``index`` on each attempt: a concurrent
+        writer (another ``session_tag`` or ``session_create`` call) can add
+        tags to this same session or to any other session between attempts,
+        and a retry that reused a stale ``existing_tags``/``new_tags`` set
+        computed before this call would silently discard that writer's tags.
+        ``now_iso`` is generated once above so a session record created on a
+        retried attempt keeps the timestamp of the original call.
+        """
+        sessions = index.setdefault("sessions", {})
 
-    if summary:
-        session["summary"] = summary
+        if session_id not in sessions:
+            sessions[session_id] = {
+                "parent": None, "children": [], "related": [],
+                "tags": [], "project": "", "skill": "", "task_type": "",
+                "summary": "", "created_at": now_iso,
+                "last_prompt": ""
+            }
 
-    # Update tag index
-    for tag in tag_list:
-        if tag not in index["tag_index"]:
-            index["tag_index"][tag] = []
-        if session_id not in index["tag_index"][tag]:
-            index["tag_index"][tag].append(session_id)
+        session = sessions[session_id]
+        existing_tags = set(session.get("tags", []))
+        new_tags = existing_tags | set(tag_list)
+        session["tags"] = sorted(new_tags)
 
-    # Auto-relate sessions that share 2+ tags
-    related_found = []
-    for other_id, other_session in index["sessions"].items():
-        if other_id == session_id:
-            continue
-        other_tags = set(other_session.get("tags", []))
-        shared = new_tags & other_tags
-        if len(shared) >= 2:
-            if other_id not in session.get("related", []):
-                session.setdefault("related", []).append(other_id)
-            if session_id not in other_session.get("related", []):
-                other_session.setdefault("related", []).append(session_id)
-            related_found.append(other_id)
+        if summary:
+            session["summary"] = summary
 
-    _chain_store.save(index)
+        tag_index = index.setdefault("tag_index", {})
+        for tag in tag_list:
+            bucket = tag_index.setdefault(tag, [])
+            if session_id not in bucket:
+                bucket.append(session_id)
+
+        for other_id, other_session in sessions.items():
+            if other_id == session_id:
+                continue
+            other_tags = set(other_session.get("tags", []))
+            if len(new_tags & other_tags) >= 2:
+                if other_id not in session.get("related", []):
+                    session.setdefault("related", []).append(other_id)
+                if session_id not in other_session.get("related", []):
+                    other_session.setdefault("related", []).append(session_id)
+
+    final_index = _chain_store.modify(_tag_session)
+
+    final_session = final_index["sessions"][session_id]
+    final_tags = set(final_session.get("tags", []))
+    related_found = [
+        other_id
+        for other_id, other_session in final_index["sessions"].items()
+        if other_id != session_id
+        and len(final_tags & set(other_session.get("tags", []))) >= 2
+    ]
 
     return {
         "success": True,
         "session_id": session_id,
-        "tags": session["tags"],
+        "tags": final_session["tags"],
         "auto_related": related_found
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
 def session_get_context(
-    session_id: str,
-    max_ancestors: int = 5,
-    max_related: int = 5
+    session_id: Annotated[str, Field(
+        description="Session whose chain context to assemble.")],
+    max_ancestors: Annotated[int, Field(
+        ge=0, le=100,
+        description="Maximum parent sessions to walk up the chain.")] = 5,
+    max_related: Annotated[int, Field(
+        ge=0, le=100,
+        description="Maximum tag-related sessions to include.")] = 5,
 ) -> dict:
     """Get chain context for a session (ancestors + related sessions).
 
@@ -663,11 +911,15 @@ def session_get_context(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @mcp_tool_handler
 def session_search_tags(
-    tags: str,
-    limit: int = 20
+    tags: Annotated[str, Field(
+        description="Comma-separated tags. A session matching ANY tag is "
+                    "returned, ranked by how many tags it matched.")],
+    limit: Annotated[int, Field(
+        ge=1, le=500,
+        description="Maximum results to return, applied after ranking.")] = 20,
 ) -> dict:
     """Search sessions by tags. Returns sessions matching ANY of the given tags.
 
@@ -701,21 +953,46 @@ def session_search_tags(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=False, openWorldHint=False))
 @mcp_tool_handler
 def session_accumulate(
-    session_id: str,
-    prompt: str = "",
-    task_type: str = "",
-    skill: str = "",
-    complexity: int = 0,
-    model: str = "",
-    cwd: str = "",
-    plan_mode: bool = False,
-    context_pct: int = 0,
-    supplementary_skills: str = "",
-    standards_count: int = 0,
-    rules_count: int = 0
+    session_id: Annotated[str, Field(
+        description="Active session to append this request to. Required.")],
+    prompt: Annotated[str, Field(
+        description="User message text. Truncated to 500 characters in the "
+                    "stored entry; the full length is recorded separately.")] = "",
+    task_type: Annotated[str, Field(
+        description="Classified task type for this request, e.g. 'Backend' or "
+                    "'Bug Fix'.")] = "",
+    skill: Annotated[str, Field(
+        description="Primary skill selected for this request.")] = "",
+    complexity: Annotated[int, Field(
+        ge=0, le=25,
+        description="Task complexity score, 0 through 25. Accumulated into the "
+                    "session total and maximum.")] = 0,
+    model: Annotated[str, Field(
+        description="Model chosen for this request, e.g. 'SONNET' or "
+                    "'OPUS'.")] = "",
+    cwd: Annotated[str, Field(
+        description="Working directory the request ran in.")] = "",
+    plan_mode: Annotated[bool, Field(
+        description="True when plan mode was used, incrementing the session's "
+                    "plan-mode counter.")] = False,
+    context_pct: Annotated[int, Field(
+        ge=0, le=100,
+        description="Estimated context-window usage percentage for this "
+                    "request. The session peak is tracked from this.")] = 0,
+    supplementary_skills: Annotated[str, Field(
+        description="Comma-separated secondary skill names used alongside the "
+                    "primary skill.")] = "",
+    standards_count: Annotated[int, Field(
+        ge=0,
+        description="Number of active standards loaded for this request.")] = 0,
+    rules_count: Annotated[int, Field(
+        ge=0,
+        description="Number of active rules loaded for this request.")] = 0,
 ) -> dict:
     """Accumulate per-request data for session summary generation.
 
@@ -740,11 +1017,30 @@ def session_accumulate(
         return {"success": False, "error": "session_id is required"}
 
     store = AtomicJsonStore(LOGS_PATH / session_id / "session-summary.json")
-    data = store.load()
-    if not data:
-        data = {
+
+    now_iso = datetime.now().isoformat()
+    supplementary_list = (
+        [s.strip() for s in supplementary_skills.split(",") if s.strip()]
+        if supplementary_skills else []
+    )
+    ctx = int(context_pct)
+    comp = int(complexity)
+
+    def _fresh_summary_defaults() -> dict:
+        """Build a new empty summary dict, called once per mutator attempt.
+
+        Returning a freshly built dict (rather than reusing one constructed
+        outside the mutator) matters here: ``AtomicJsonStore.load`` returns
+        a shallow copy of any ``default`` dict it is given, so a dict built
+        once and passed via ``default=`` would share its nested list objects
+        across every retry attempt. A mutator that appended to such a shared
+        list would leave earlier, discarded attempts' entries behind in the
+        list a later, winning attempt publishes. Building the dict fresh
+        inside the mutator avoids that shared-state hazard entirely.
+        """
+        return {
             "session_id": session_id,
-            "created_at": datetime.now().isoformat(),
+            "created_at": now_iso,
             "requests": [],
             "request_count": 0,
             "skills_used": [],
@@ -759,56 +1055,64 @@ def session_accumulate(
             "status": "IN_PROGRESS"
         }
 
-    # Add request entry
-    entry = {
-        "timestamp": datetime.now().isoformat(),
-        "prompt": prompt[:500],
-        "prompt_char_count": len(prompt),
-        "task_type": task_type,
-        "skill": skill,
-        "complexity": complexity,
-        "model": model,
-        "cwd": cwd,
-        "plan_mode": plan_mode,
-        "context_pct": context_pct,
-        "supplementary_skills": [s.strip() for s in supplementary_skills.split(",") if s.strip()] if supplementary_skills else [],
-        "decision_rationale": f"Complexity {complexity} -> Model {model}, Skill {skill}",
-    }
+    def _accumulate(data: dict) -> None:
+        """Append this request and update every aggregate derived from it.
 
-    data["requests"].append(entry)
-    data["request_count"] = len(data["requests"])
-    data["last_updated"] = datetime.now().isoformat()
+        ``now_iso``, ``supplementary_list``, ``ctx`` and ``comp`` are
+        derived only from the tool's own parameters, not from ``data``, so
+        they are safe to compute once above and close over. Every aggregate
+        below -- unique skill/task/model lists, the supplementary-skill
+        set, the plan-mode counter, and the complexity and context totals
+        -- is a running total over ``data`` itself, so it must be
+        recomputed from the freshly loaded ``data`` on every attempt or a
+        retry would double-count against a value a discarded attempt had
+        already added.
+        """
+        if not data:
+            data.update(_fresh_summary_defaults())
 
-    # Track unique values
-    if skill and skill not in data["skills_used"]:
-        data["skills_used"].append(skill)
-    if task_type and task_type not in data["task_types"]:
-        data["task_types"].append(task_type)
-    if model and model not in data["models_used"]:
-        data["models_used"].append(model)
+        entry = {
+            "timestamp": now_iso,
+            "prompt": prompt[:500],
+            "prompt_char_count": len(prompt),
+            "task_type": task_type,
+            "skill": skill,
+            "complexity": complexity,
+            "model": model,
+            "cwd": cwd,
+            "plan_mode": plan_mode,
+            "context_pct": context_pct,
+            "supplementary_skills": supplementary_list,
+            "decision_rationale": f"Complexity {complexity} -> Model {model}, Skill {skill}",
+        }
 
-    # Supplementary skills
-    if supplementary_skills:
-        for s in supplementary_skills.split(","):
-            s = s.strip()
-            if s and s not in data.get("all_supplementary_skills", []):
-                data.setdefault("all_supplementary_skills", []).append(s)
+        data.setdefault("requests", []).append(entry)
+        data["request_count"] = len(data["requests"])
+        data["last_updated"] = now_iso
 
-    # Plan mode
-    if plan_mode:
-        data["plan_mode_count"] = data.get("plan_mode_count", 0) + 1
+        if skill and skill not in data.setdefault("skills_used", []):
+            data["skills_used"].append(skill)
+        if task_type and task_type not in data.setdefault("task_types", []):
+            data["task_types"].append(task_type)
+        if model and model not in data.setdefault("models_used", []):
+            data["models_used"].append(model)
 
-    # Context tracking
-    ctx = int(context_pct)
-    data.setdefault("context_history", []).append(ctx)
-    data["peak_context_pct"] = max(data.get("peak_context_pct", 0), ctx)
+        if supplementary_list:
+            all_supp = data.setdefault("all_supplementary_skills", [])
+            for s in supplementary_list:
+                if s not in all_supp:
+                    all_supp.append(s)
 
-    # Complexity tracking
-    comp = int(complexity)
-    data["total_complexity"] = data.get("total_complexity", 0) + comp
-    data["max_complexity"] = max(data.get("max_complexity", 0), comp)
+        if plan_mode:
+            data["plan_mode_count"] = data.get("plan_mode_count", 0) + 1
 
-    store.save(data)
+        data.setdefault("context_history", []).append(ctx)
+        data["peak_context_pct"] = max(data.get("peak_context_pct", 0), ctx)
+
+        data["total_complexity"] = data.get("total_complexity", 0) + comp
+        data["max_complexity"] = max(data.get("max_complexity", 0), comp)
+
+    data = store.modify(_accumulate)
 
     return {
         "success": True,
@@ -819,9 +1123,16 @@ def session_accumulate(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=True, openWorldHint=False))
 @mcp_tool_handler
-def session_finalize(session_id: str) -> dict:
+def session_finalize(
+    session_id: Annotated[str, Field(
+        description="Session to close out. Merges accumulated request data "
+                    "with tool stats and flow-trace decisions into a markdown "
+                    "summary.")],
+) -> dict:
     """Generate comprehensive session summary on session close.
 
     Merges accumulated request data with tool stats, flow-trace decisions,
@@ -836,76 +1147,64 @@ def session_finalize(session_id: str) -> dict:
         return {"success": False, "error": "session_id is required"}
 
     store = AtomicJsonStore(LOGS_PATH / session_id / "session-summary.json")
-    data = store.load()
-    if not data:
-        return {
-            "success": False,
-            "error": f"No accumulated data for {session_id}"
-        }
 
-    # Load flow-trace for pipeline decisions
+    source_warnings_base = []
+
     flow_trace_file = LOGS_PATH / session_id / "flow-trace.json"
     flow_trace = None
     if flow_trace_file.exists():
         try:
             flow_trace = json.loads(flow_trace_file.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            source_warnings_base.append(
+                f"flow-trace.json unreadable ({type(e).__name__}) - policy "
+                "counts omitted from this summary"
+            )
 
-    # Load tool tracker for file stats
     tool_tracker_file = LOGS_PATH / session_id / "tool-tracker.jsonl"
     files_modified = set()
     files_read = set()
     tool_count = 0
     error_count = 0
+    skipped_lines = 0
     if tool_tracker_file.exists():
         try:
-            for line in tool_tracker_file.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
+            raw_lines = tool_tracker_file.read_text(encoding="utf-8").splitlines()
+        except OSError as e:
+            raw_lines = []
+            source_warnings_base.append(
+                f"tool-tracker.jsonl unreadable ({type(e).__name__}) - tool "
+                "statistics omitted from this summary"
+            )
+        for line in raw_lines:
+            if not line.strip():
+                continue
+            try:
                 entry = json.loads(line)
-                tool_count += 1
-                tool_name = entry.get("tool", "")
-                file_path = entry.get("file", "")
-                if entry.get("error"):
-                    error_count += 1
-                if file_path:
-                    if tool_name in ("Write", "Edit"):
-                        files_modified.add(file_path)
-                    elif tool_name == "Read":
-                        files_read.add(file_path)
-        except Exception:
-            pass
+            except json.JSONDecodeError:
+                skipped_lines += 1
+                continue
+            if not isinstance(entry, dict):
+                skipped_lines += 1
+                continue
+            tool_count += 1
+            tool_name = entry.get("tool", "")
+            file_path = entry.get("file", "")
+            if entry.get("error"):
+                error_count += 1
+            if file_path:
+                if tool_name in ("Write", "Edit"):
+                    files_modified.add(file_path)
+                elif tool_name == "Read":
+                    files_read.add(file_path)
+        if skipped_lines:
+            source_warnings_base.append(
+                f"{skipped_lines} malformed line(s) in tool-tracker.jsonl were "
+                "skipped"
+            )
 
-    # Calculate duration
-    created = data.get("created_at", "")
-    last_updated = data.get("last_updated", datetime.now().isoformat())
-    duration_human = ""
-    duration_seconds = 0
-    if created:
-        try:
-            start = datetime.fromisoformat(created)
-            end = datetime.fromisoformat(last_updated)
-            diff = end - start
-            duration_seconds = int(diff.total_seconds())
-            hours, remainder = divmod(duration_seconds, 3600)
-            minutes, secs = divmod(remainder, 60)
-            if hours > 0:
-                duration_human = f"{hours}h {minutes}m {secs}s"
-            elif minutes > 0:
-                duration_human = f"{minutes}m {secs}s"
-            else:
-                duration_human = f"{secs}s"
-        except Exception:
-            pass
-
-    # Calculate stats
-    req_count = data.get("request_count", 0)
-    total_complexity = data.get("total_complexity", 0)
-    avg_complexity = round(total_complexity / req_count, 1) if req_count > 0 else 0
     success_rate = round(((tool_count - error_count) / tool_count) * 100, 1) if tool_count > 0 else 100.0
 
-    # Policy execution stats
     policy_count = 0
     policy_duration = 0
     if flow_trace:
@@ -913,7 +1212,82 @@ def session_finalize(session_id: str) -> dict:
         policy_count = len(policies)
         policy_duration = sum(p.get("duration_ms", 0) for p in policies)
 
-    # Generate markdown summary
+    def _finalize_summary(data: dict) -> None:
+        """Compute finalize-time derived fields and merge them into ``data``.
+
+        ``flow_trace``, ``tool_count``, ``error_count``, ``files_modified``,
+        ``files_read``, ``policy_count``, ``policy_duration``,
+        ``success_rate`` and ``source_warnings_base`` come from
+        ``flow-trace.json`` and ``tool-tracker.jsonl``, files this store does
+        not own and no concurrent writer of this session-summary store
+        touches, so they are read once above and reused across attempts.
+        Duration and the complexity average must be recomputed from ``data``
+        on every attempt: a concurrent ``session_accumulate`` call can add
+        another request between attempts, changing ``request_count``,
+        ``total_complexity`` and ``last_updated``, and a retry that reused
+        values computed before this call would finalize against a stale
+        snapshot. ``local_warnings`` is rebuilt fresh each attempt from
+        ``source_warnings_base`` rather than appended to it in place, so a
+        discarded attempt's duration warning cannot survive into the
+        winning attempt's ``data``.
+        """
+        if not data:
+            raise _NoAccumulatedDataError(session_id)
+
+        local_warnings = list(source_warnings_base)
+
+        created = data.get("created_at", "")
+        last_updated = data.get("last_updated", datetime.now().isoformat())
+        duration_human = ""
+        duration_seconds = 0
+        if created:
+            try:
+                start = datetime.fromisoformat(created)
+                end = datetime.fromisoformat(last_updated)
+                diff = end - start
+                duration_seconds = int(diff.total_seconds())
+                hours, remainder = divmod(duration_seconds, 3600)
+                minutes, secs = divmod(remainder, 60)
+                if hours > 0:
+                    duration_human = f"{hours}h {minutes}m {secs}s"
+                elif minutes > 0:
+                    duration_human = f"{minutes}m {secs}s"
+                else:
+                    duration_human = f"{secs}s"
+            except (TypeError, ValueError) as e:
+                local_warnings.append(
+                    f"Could not compute duration ({type(e).__name__}): timestamps "
+                    "are not valid ISO 8601"
+                )
+
+        req_count = data.get("request_count", 0)
+        total_complexity = data.get("total_complexity", 0)
+        avg_complexity = round(total_complexity / req_count, 1) if req_count > 0 else 0
+
+        data["status"] = "COMPLETED"
+        data["duration_human"] = duration_human
+        data["duration_seconds"] = duration_seconds
+        data["avg_complexity"] = avg_complexity
+        data["files_modified"] = sorted(files_modified)
+        data["files_read"] = sorted(files_read)
+        data["total_tool_calls"] = tool_count
+        data["error_count"] = error_count
+        data["success_rate_pct"] = success_rate
+        data["source_warnings"] = local_warnings
+
+    try:
+        data = store.modify(_finalize_summary)
+    except _NoAccumulatedDataError:
+        return {
+            "success": False,
+            "error": f"No accumulated data for {session_id}"
+        }
+
+    req_count = data.get("request_count", 0)
+    avg_complexity = data.get("avg_complexity", 0)
+    duration_human = data.get("duration_human", "")
+    source_warnings = data.get("source_warnings", [])
+
     md_lines = [
         f"# Session Summary: {session_id}",
         "",
@@ -935,13 +1309,11 @@ def session_finalize(session_id: str) -> dict:
         "",
     ]
 
-    # Supplementary skills
     supp = data.get("all_supplementary_skills", [])
     if supp:
         md_lines.append(f"**Supplementary Skills:** {', '.join(supp)}")
         md_lines.append("")
 
-    # Request log
     md_lines.append("## Request Log")
     md_lines.append("")
     md_lines.append("| # | Time | Type | Skill | Complexity | Model |")
@@ -955,7 +1327,6 @@ def session_finalize(session_id: str) -> dict:
         )
     md_lines.append("")
 
-    # Files section
     if files_modified:
         md_lines.append("## Files Modified")
         md_lines.append("")
@@ -963,7 +1334,6 @@ def session_finalize(session_id: str) -> dict:
             md_lines.append(f"- {f}")
         md_lines.append("")
 
-    # Pipeline decisions
     if flow_trace:
         decisions = flow_trace.get("decisions_timeline", [])
         if decisions:
@@ -978,32 +1348,29 @@ def session_finalize(session_id: str) -> dict:
 
     summary_md = "\n".join(md_lines)
 
-    # Save markdown summary
     session_dir = LOGS_PATH / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
     md_path = session_dir / "session-summary.md"
     md_path.write_text(summary_md, encoding="utf-8")
 
-    # Update accumulated data status
-    data["status"] = "COMPLETED"
-    data["duration_human"] = duration_human
-    data["duration_seconds"] = duration_seconds
-    data["avg_complexity"] = avg_complexity
-    data["files_modified"] = sorted(files_modified)
-    data["files_read"] = sorted(files_read)
-    data["total_tool_calls"] = tool_count
-    data["error_count"] = error_count
-    data["success_rate_pct"] = success_rate
-    store.save(data)
+    def _record_chain_summary(index: dict) -> None:
+        """Copy the finalized one-line summary onto the chain-index record.
 
-    # Update chain index summary
-    index = _chain_store.load()
-    if session_id in index.get("sessions", {}):
-        index["sessions"][session_id]["summary"] = (
-            f"{req_count} requests, {', '.join(data.get('skills_used', [])[:3])}, "
-            f"complexity avg {avg_complexity}"
-        )
-        _chain_store.save(index)
+        ``req_count``, ``avg_complexity`` and the skills list are read from
+        ``data``, the dict ``store.modify()`` already resolved and returned
+        above -- the winning session-summary write, not a value computed
+        before that race was settled. The membership check is redone here
+        because a session can be removed from the index between the
+        finalize write and this one; a stale check computed earlier could
+        write ``index["sessions"][session_id]`` back into existence.
+        """
+        if session_id in index.get("sessions", {}):
+            index["sessions"][session_id]["summary"] = (
+                f"{req_count} requests, {', '.join(data.get('skills_used', [])[:3])}, "
+                f"complexity avg {avg_complexity}"
+            )
+
+    _chain_store.modify(_record_chain_summary)
 
     return {
         "success": True,
@@ -1013,17 +1380,26 @@ def session_finalize(session_id: str) -> dict:
         "requests": req_count,
         "tools": tool_count,
         "files_modified": len(files_modified),
-        "policies": policy_count
+        "policies": policy_count,
+        "source_warnings": source_warnings
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=False, openWorldHint=False))
 @mcp_tool_handler
 def session_add_work_item(
-    session_id: str,
-    description: str,
-    work_type: str = "TASK",
-    metadata: str = "{}"
+    session_id: Annotated[str, Field(
+        description="Existing session to attach the work item to.")],
+    description: Annotated[str, Field(
+        description="What the work item covers.")],
+    work_type: Annotated[str, Field(
+        description="Prefix for the generated work item id, e.g. 'TASK', "
+                    "'WORK', 'BUG'.")] = "TASK",
+    metadata: Annotated[str, Field(
+        description="JSON object string of extra fields stored on the work "
+                    "item. Invalid JSON is stored as an empty object.")] = "{}",
 ) -> dict:
     """Add a work item to a session for tracking tasks within sessions.
 
@@ -1033,18 +1409,10 @@ def session_add_work_item(
         work_type: Type prefix for work item ID (e.g., 'TASK', 'WORK', 'BUG')
         metadata: JSON string of additional fields
     """
-    index = _chain_store.load()
-
-    if session_id not in index["sessions"]:
-        return {"success": False, "error": f"Session not found: {session_id}"}
-
-    session = index["sessions"][session_id]
-
-    # Generate work item ID
     suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
     work_id = f"{work_type}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{suffix}"
+    started_at = datetime.now().isoformat()
 
-    # Parse metadata
     try:
         meta = json.loads(metadata)
     except (json.JSONDecodeError, TypeError):
@@ -1054,14 +1422,30 @@ def session_add_work_item(
         "work_id": work_id,
         "type": work_type,
         "description": description,
-        "started_at": datetime.now().isoformat(),
+        "started_at": started_at,
         "completed_at": None,
         "status": "IN_PROGRESS",
         "metadata": meta
     }
 
-    session.setdefault("work_items", []).append(work_item)
-    _chain_store.save(index)
+    def _add_work_item(index: dict) -> None:
+        """Append the new work item to its session's work-item list.
+
+        ``work_id`` is returned to the caller and is later looked up by
+        ``session_complete_work_item``, so it is generated once above and
+        closed over: a work item id that changed per retry would let a
+        losing attempt's id leak into the response while a different id
+        was actually persisted. The membership check is redone here since
+        the session could be removed from the index between attempts.
+        """
+        if session_id not in index.get("sessions", {}):
+            raise _SessionNotFoundError(session_id)
+        index["sessions"][session_id].setdefault("work_items", []).append(work_item)
+
+    try:
+        _chain_store.modify(_add_work_item)
+    except _SessionNotFoundError:
+        return {"success": False, "error": f"Session not found: {session_id}"}
 
     return {
         "success": True,
@@ -1072,12 +1456,17 @@ def session_add_work_item(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False,
+    idempotentHint=True, openWorldHint=False))
 @mcp_tool_handler
 def session_complete_work_item(
-    session_id: str,
-    work_id: str,
-    status: str = "COMPLETED"
+    session_id: Annotated[str, Field(
+        description="Session holding the work item.")],
+    work_id: Annotated[str, Field(
+        description="Work item id returned by session_add_work_item.")],
+    status: Annotated[str, Field(
+        description="Terminal status: COMPLETED, FAILED, or SKIPPED.")] = "COMPLETED",
 ) -> dict:
     """Mark a work item as completed.
 
@@ -1086,33 +1475,50 @@ def session_complete_work_item(
         work_id: Work item ID to complete
         status: Final status (COMPLETED, FAILED, SKIPPED)
     """
-    index = _chain_store.load()
+    def _complete_work_item(index: dict) -> None:
+        """Find the work item by id and mark it terminal in place.
 
-    if session_id not in index["sessions"]:
+        The membership and work-item lookup are redone on every attempt
+        rather than reused from a prior read: a concurrent
+        ``session_add_work_item`` call could be the one that makes the
+        target id exist. ``completed_at`` is generated inside the mutator
+        so it reflects the winning attempt's actual persist time rather
+        than a candidate time decided before the race was settled; the
+        caller reads the persisted value back from the dict this function
+        returns instead of generating a second, possibly different,
+        timestamp for the response.
+        """
+        if session_id not in index.get("sessions", {}):
+            raise _SessionNotFoundError(session_id)
+        work_items = index["sessions"][session_id].get("work_items", [])
+        for item in work_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("work_id") == work_id:
+                item["completed_at"] = datetime.now().isoformat()
+                item["status"] = status
+                return
+        raise _WorkItemNotFoundError(work_id)
+
+    try:
+        index = _chain_store.modify(_complete_work_item)
+    except _SessionNotFoundError:
         return {"success": False, "error": f"Session not found: {session_id}"}
-
-    session = index["sessions"][session_id]
-    work_items = session.get("work_items", [])
-
-    found = False
-    for item in work_items:
-        if item["work_id"] == work_id:
-            item["completed_at"] = datetime.now().isoformat()
-            item["status"] = status
-            found = True
-            break
-
-    if not found:
+    except _WorkItemNotFoundError:
         return {"success": False, "error": f"Work item not found: {work_id}"}
 
-    _chain_store.save(index)
+    completed_item = next(
+        (item for item in index["sessions"][session_id].get("work_items", [])
+         if isinstance(item, dict) and item.get("work_id") == work_id),
+        {}
+    )
 
     return {
         "success": True,
         "work_id": work_id,
         "session_id": session_id,
         "status": status,
-        "completed_at": datetime.now().isoformat()
+        "completed_at": completed_item.get("completed_at", "")
     }
 
 
