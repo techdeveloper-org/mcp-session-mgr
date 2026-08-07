@@ -73,6 +73,31 @@ _READ_ONLY = ToolAnnotations(
 )
 
 
+class _SessionNotFoundError(LookupError):
+    """Raised inside a chain-index mutator when the target session is absent.
+
+    Caught immediately after the ``modify()`` call by the owning tool and
+    translated into that tool's existing ``{"success": False, ...}`` shape.
+    Never propagates past its own tool function.
+    """
+
+
+class _WorkItemNotFoundError(LookupError):
+    """Raised inside a chain-index mutator when the target work item is absent.
+
+    Caught immediately after the ``modify()`` call by the owning tool and
+    translated into that tool's existing ``{"success": False, ...}`` shape.
+    """
+
+
+class _NoAccumulatedDataError(LookupError):
+    """Raised inside the finalize mutator when a session has no accumulated data.
+
+    Caught immediately after the ``modify()`` call and translated into the
+    tool's existing ``{"success": False, ...}`` shape.
+    """
+
+
 def _safe_component(value: str, field_name: str) -> str:
     """Validate a caller-supplied string that becomes a single path component.
 
@@ -603,29 +628,36 @@ def session_create(
     # Auto-extract tags
     tags = _extract_tags(prompt, task_type, skill, project_cwd)
 
-    # Register in chain index
-    index = _chain_store.load()
-    index["sessions"][session_id] = {
-        "parent": None,
-        "children": [],
-        "related": [],
-        "tags": tags,
-        "project": project,
-        "skill": skill,
-        "task_type": task_type,
-        "summary": "",
-        "created_at": now.isoformat(),
-        "last_prompt": prompt[:200] if prompt else ""
-    }
+    def _register_session(index: dict) -> None:
+        """Insert the new session record and merge it into the tag index.
 
-    # Update tag index
-    for tag in tags:
-        if tag not in index["tag_index"]:
-            index["tag_index"][tag] = []
-        if session_id not in index["tag_index"][tag]:
-            index["tag_index"][tag].append(session_id)
+        ``session_id``, ``tags`` and ``now`` are generated once above, before
+        the retryable cycle starts, so every retry of this same logical
+        create call registers the identical session id rather than a
+        different one per attempt. The tag-index merge itself must be
+        recomputed from ``index`` on every attempt: another writer's tags
+        for unrelated sessions may have landed between attempts and must not
+        be discarded.
+        """
+        index.setdefault("sessions", {})[session_id] = {
+            "parent": None,
+            "children": [],
+            "related": [],
+            "tags": tags,
+            "project": project,
+            "skill": skill,
+            "task_type": task_type,
+            "summary": "",
+            "created_at": now.isoformat(),
+            "last_prompt": prompt[:200] if prompt else ""
+        }
+        tag_index = index.setdefault("tag_index", {})
+        for tag in tags:
+            bucket = tag_index.setdefault(tag, [])
+            if session_id not in bucket:
+                bucket.append(session_id)
 
-    _chain_store.save(index)
+    _chain_store.modify(_register_session)
 
     # Update current session pointer
     CURRENT_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -663,29 +695,41 @@ def session_link(
         child_id: New session ID (child)
         parent_id: Previous session ID (parent)
     """
-    index = _chain_store.load()
+    now_iso = datetime.now().isoformat()
 
-    if parent_id not in index["sessions"]:
-        index["sessions"][parent_id] = {
-            "parent": None, "children": [], "related": [],
-            "tags": [], "project": "", "skill": "", "task_type": "",
-            "summary": "", "created_at": "", "last_prompt": ""
-        }
+    def _link(index: dict) -> None:
+        """Create any missing parent/child records and link them.
 
-    if child_id not in index["sessions"]:
-        index["sessions"][child_id] = {
-            "parent": parent_id, "children": [], "related": [],
-            "tags": [], "project": "", "skill": "", "task_type": "",
-            "summary": "", "created_at": datetime.now().isoformat(),
-            "last_prompt": ""
-        }
-    else:
-        index["sessions"][child_id]["parent"] = parent_id
+        ``now_iso`` is generated once above so a child record created on a
+        retried attempt keeps the same ``created_at`` as the intent that
+        triggered this call, rather than a later retry's clock reading.
+        Membership checks against ``index`` must be redone on every attempt:
+        a concurrent ``session_create`` or ``session_tag`` call may have
+        added either record between attempts.
+        """
+        sessions = index.setdefault("sessions", {})
 
-    if child_id not in index["sessions"][parent_id]["children"]:
-        index["sessions"][parent_id]["children"].append(child_id)
+        if parent_id not in sessions:
+            sessions[parent_id] = {
+                "parent": None, "children": [], "related": [],
+                "tags": [], "project": "", "skill": "", "task_type": "",
+                "summary": "", "created_at": "", "last_prompt": ""
+            }
 
-    _chain_store.save(index)
+        if child_id not in sessions:
+            sessions[child_id] = {
+                "parent": parent_id, "children": [], "related": [],
+                "tags": [], "project": "", "skill": "", "task_type": "",
+                "summary": "", "created_at": now_iso,
+                "last_prompt": ""
+            }
+        else:
+            sessions[child_id]["parent"] = parent_id
+
+        if child_id not in sessions[parent_id]["children"]:
+            sessions[parent_id]["children"].append(child_id)
+
+    _chain_store.modify(_link)
 
     return {
         "success": True,
@@ -715,52 +759,71 @@ def session_tag(
         tags: Comma-separated tag list (e.g., 'spring-boot,docker,scheduler')
         summary: Optional session summary text
     """
-    index = _chain_store.load()
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    now_iso = datetime.now().isoformat()
 
-    if session_id not in index["sessions"]:
-        index["sessions"][session_id] = {
-            "parent": None, "children": [], "related": [],
-            "tags": [], "project": "", "skill": "", "task_type": "",
-            "summary": "", "created_at": datetime.now().isoformat(),
-            "last_prompt": ""
-        }
+    def _tag_session(index: dict) -> None:
+        """Merge tags, the tag index, and shared-tag auto-relations.
 
-    session = index["sessions"][session_id]
-    existing_tags = set(session.get("tags", []))
-    new_tags = existing_tags | set(tag_list)
-    session["tags"] = sorted(new_tags)
+        Every value this mutator needs -- the session's existing tags, the
+        tag index, and every other session's tags for the auto-relate scan
+        -- must be read fresh from ``index`` on each attempt: a concurrent
+        writer (another ``session_tag`` or ``session_create`` call) can add
+        tags to this same session or to any other session between attempts,
+        and a retry that reused a stale ``existing_tags``/``new_tags`` set
+        computed before this call would silently discard that writer's tags.
+        ``now_iso`` is generated once above so a session record created on a
+        retried attempt keeps the timestamp of the original call.
+        """
+        sessions = index.setdefault("sessions", {})
 
-    if summary:
-        session["summary"] = summary
+        if session_id not in sessions:
+            sessions[session_id] = {
+                "parent": None, "children": [], "related": [],
+                "tags": [], "project": "", "skill": "", "task_type": "",
+                "summary": "", "created_at": now_iso,
+                "last_prompt": ""
+            }
 
-    # Update tag index
-    for tag in tag_list:
-        if tag not in index["tag_index"]:
-            index["tag_index"][tag] = []
-        if session_id not in index["tag_index"][tag]:
-            index["tag_index"][tag].append(session_id)
+        session = sessions[session_id]
+        existing_tags = set(session.get("tags", []))
+        new_tags = existing_tags | set(tag_list)
+        session["tags"] = sorted(new_tags)
 
-    # Auto-relate sessions that share 2+ tags
-    related_found = []
-    for other_id, other_session in index["sessions"].items():
-        if other_id == session_id:
-            continue
-        other_tags = set(other_session.get("tags", []))
-        shared = new_tags & other_tags
-        if len(shared) >= 2:
-            if other_id not in session.get("related", []):
-                session.setdefault("related", []).append(other_id)
-            if session_id not in other_session.get("related", []):
-                other_session.setdefault("related", []).append(session_id)
-            related_found.append(other_id)
+        if summary:
+            session["summary"] = summary
 
-    _chain_store.save(index)
+        tag_index = index.setdefault("tag_index", {})
+        for tag in tag_list:
+            bucket = tag_index.setdefault(tag, [])
+            if session_id not in bucket:
+                bucket.append(session_id)
+
+        for other_id, other_session in sessions.items():
+            if other_id == session_id:
+                continue
+            other_tags = set(other_session.get("tags", []))
+            if len(new_tags & other_tags) >= 2:
+                if other_id not in session.get("related", []):
+                    session.setdefault("related", []).append(other_id)
+                if session_id not in other_session.get("related", []):
+                    other_session.setdefault("related", []).append(session_id)
+
+    final_index = _chain_store.modify(_tag_session)
+
+    final_session = final_index["sessions"][session_id]
+    final_tags = set(final_session.get("tags", []))
+    related_found = [
+        other_id
+        for other_id, other_session in final_index["sessions"].items()
+        if other_id != session_id
+        and len(final_tags & set(other_session.get("tags", []))) >= 2
+    ]
 
     return {
         "success": True,
         "session_id": session_id,
-        "tags": session["tags"],
+        "tags": final_session["tags"],
         "auto_related": related_found
     }
 
@@ -954,11 +1017,30 @@ def session_accumulate(
         return {"success": False, "error": "session_id is required"}
 
     store = AtomicJsonStore(LOGS_PATH / session_id / "session-summary.json")
-    data = store.load()
-    if not data:
-        data = {
+
+    now_iso = datetime.now().isoformat()
+    supplementary_list = (
+        [s.strip() for s in supplementary_skills.split(",") if s.strip()]
+        if supplementary_skills else []
+    )
+    ctx = int(context_pct)
+    comp = int(complexity)
+
+    def _fresh_summary_defaults() -> dict:
+        """Build a new empty summary dict, called once per mutator attempt.
+
+        Returning a freshly built dict (rather than reusing one constructed
+        outside the mutator) matters here: ``AtomicJsonStore.load`` returns
+        a shallow copy of any ``default`` dict it is given, so a dict built
+        once and passed via ``default=`` would share its nested list objects
+        across every retry attempt. A mutator that appended to such a shared
+        list would leave earlier, discarded attempts' entries behind in the
+        list a later, winning attempt publishes. Building the dict fresh
+        inside the mutator avoids that shared-state hazard entirely.
+        """
+        return {
             "session_id": session_id,
-            "created_at": datetime.now().isoformat(),
+            "created_at": now_iso,
             "requests": [],
             "request_count": 0,
             "skills_used": [],
@@ -973,56 +1055,64 @@ def session_accumulate(
             "status": "IN_PROGRESS"
         }
 
-    # Add request entry
-    entry = {
-        "timestamp": datetime.now().isoformat(),
-        "prompt": prompt[:500],
-        "prompt_char_count": len(prompt),
-        "task_type": task_type,
-        "skill": skill,
-        "complexity": complexity,
-        "model": model,
-        "cwd": cwd,
-        "plan_mode": plan_mode,
-        "context_pct": context_pct,
-        "supplementary_skills": [s.strip() for s in supplementary_skills.split(",") if s.strip()] if supplementary_skills else [],
-        "decision_rationale": f"Complexity {complexity} -> Model {model}, Skill {skill}",
-    }
+    def _accumulate(data: dict) -> None:
+        """Append this request and update every aggregate derived from it.
 
-    data["requests"].append(entry)
-    data["request_count"] = len(data["requests"])
-    data["last_updated"] = datetime.now().isoformat()
+        ``now_iso``, ``supplementary_list``, ``ctx`` and ``comp`` are
+        derived only from the tool's own parameters, not from ``data``, so
+        they are safe to compute once above and close over. Every aggregate
+        below -- unique skill/task/model lists, the supplementary-skill
+        set, the plan-mode counter, and the complexity and context totals
+        -- is a running total over ``data`` itself, so it must be
+        recomputed from the freshly loaded ``data`` on every attempt or a
+        retry would double-count against a value a discarded attempt had
+        already added.
+        """
+        if not data:
+            data.update(_fresh_summary_defaults())
 
-    # Track unique values
-    if skill and skill not in data["skills_used"]:
-        data["skills_used"].append(skill)
-    if task_type and task_type not in data["task_types"]:
-        data["task_types"].append(task_type)
-    if model and model not in data["models_used"]:
-        data["models_used"].append(model)
+        entry = {
+            "timestamp": now_iso,
+            "prompt": prompt[:500],
+            "prompt_char_count": len(prompt),
+            "task_type": task_type,
+            "skill": skill,
+            "complexity": complexity,
+            "model": model,
+            "cwd": cwd,
+            "plan_mode": plan_mode,
+            "context_pct": context_pct,
+            "supplementary_skills": supplementary_list,
+            "decision_rationale": f"Complexity {complexity} -> Model {model}, Skill {skill}",
+        }
 
-    # Supplementary skills
-    if supplementary_skills:
-        for s in supplementary_skills.split(","):
-            s = s.strip()
-            if s and s not in data.get("all_supplementary_skills", []):
-                data.setdefault("all_supplementary_skills", []).append(s)
+        data.setdefault("requests", []).append(entry)
+        data["request_count"] = len(data["requests"])
+        data["last_updated"] = now_iso
 
-    # Plan mode
-    if plan_mode:
-        data["plan_mode_count"] = data.get("plan_mode_count", 0) + 1
+        if skill and skill not in data.setdefault("skills_used", []):
+            data["skills_used"].append(skill)
+        if task_type and task_type not in data.setdefault("task_types", []):
+            data["task_types"].append(task_type)
+        if model and model not in data.setdefault("models_used", []):
+            data["models_used"].append(model)
 
-    # Context tracking
-    ctx = int(context_pct)
-    data.setdefault("context_history", []).append(ctx)
-    data["peak_context_pct"] = max(data.get("peak_context_pct", 0), ctx)
+        if supplementary_list:
+            all_supp = data.setdefault("all_supplementary_skills", [])
+            for s in supplementary_list:
+                if s not in all_supp:
+                    all_supp.append(s)
 
-    # Complexity tracking
-    comp = int(complexity)
-    data["total_complexity"] = data.get("total_complexity", 0) + comp
-    data["max_complexity"] = max(data.get("max_complexity", 0), comp)
+        if plan_mode:
+            data["plan_mode_count"] = data.get("plan_mode_count", 0) + 1
 
-    store.save(data)
+        data.setdefault("context_history", []).append(ctx)
+        data["peak_context_pct"] = max(data.get("peak_context_pct", 0), ctx)
+
+        data["total_complexity"] = data.get("total_complexity", 0) + comp
+        data["max_complexity"] = max(data.get("max_complexity", 0), comp)
+
+    data = store.modify(_accumulate)
 
     return {
         "success": True,
@@ -1057,32 +1147,20 @@ def session_finalize(
         return {"success": False, "error": "session_id is required"}
 
     store = AtomicJsonStore(LOGS_PATH / session_id / "session-summary.json")
-    data = store.load()
-    if not data:
-        return {
-            "success": False,
-            "error": f"No accumulated data for {session_id}"
-        }
 
-    # Warnings recorded on the summary so a partially-derived report never
-    # presents itself as a complete one.
-    source_warnings = []
+    source_warnings_base = []
 
-    # Load flow-trace for pipeline decisions
     flow_trace_file = LOGS_PATH / session_id / "flow-trace.json"
     flow_trace = None
     if flow_trace_file.exists():
         try:
             flow_trace = json.loads(flow_trace_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as e:
-            source_warnings.append(
+            source_warnings_base.append(
                 f"flow-trace.json unreadable ({type(e).__name__}) - policy "
                 "counts omitted from this summary"
             )
 
-    # Load tool tracker for file stats. Each line is parsed independently: a
-    # single malformed line previously aborted the whole scan, silently
-    # under-reporting tool counts and modified files in the generated summary.
     tool_tracker_file = LOGS_PATH / session_id / "tool-tracker.jsonl"
     files_modified = set()
     files_read = set()
@@ -1094,7 +1172,7 @@ def session_finalize(
             raw_lines = tool_tracker_file.read_text(encoding="utf-8").splitlines()
         except OSError as e:
             raw_lines = []
-            source_warnings.append(
+            source_warnings_base.append(
                 f"tool-tracker.jsonl unreadable ({type(e).__name__}) - tool "
                 "statistics omitted from this summary"
             )
@@ -1120,43 +1198,13 @@ def session_finalize(
                 elif tool_name == "Read":
                     files_read.add(file_path)
         if skipped_lines:
-            source_warnings.append(
+            source_warnings_base.append(
                 f"{skipped_lines} malformed line(s) in tool-tracker.jsonl were "
                 "skipped"
             )
 
-    # Calculate duration
-    created = data.get("created_at", "")
-    last_updated = data.get("last_updated", datetime.now().isoformat())
-    duration_human = ""
-    duration_seconds = 0
-    if created:
-        try:
-            start = datetime.fromisoformat(created)
-            end = datetime.fromisoformat(last_updated)
-            diff = end - start
-            duration_seconds = int(diff.total_seconds())
-            hours, remainder = divmod(duration_seconds, 3600)
-            minutes, secs = divmod(remainder, 60)
-            if hours > 0:
-                duration_human = f"{hours}h {minutes}m {secs}s"
-            elif minutes > 0:
-                duration_human = f"{minutes}m {secs}s"
-            else:
-                duration_human = f"{secs}s"
-        except (TypeError, ValueError) as e:
-            source_warnings.append(
-                f"Could not compute duration ({type(e).__name__}): timestamps "
-                "are not valid ISO 8601"
-            )
-
-    # Calculate stats
-    req_count = data.get("request_count", 0)
-    total_complexity = data.get("total_complexity", 0)
-    avg_complexity = round(total_complexity / req_count, 1) if req_count > 0 else 0
     success_rate = round(((tool_count - error_count) / tool_count) * 100, 1) if tool_count > 0 else 100.0
 
-    # Policy execution stats
     policy_count = 0
     policy_duration = 0
     if flow_trace:
@@ -1164,7 +1212,82 @@ def session_finalize(
         policy_count = len(policies)
         policy_duration = sum(p.get("duration_ms", 0) for p in policies)
 
-    # Generate markdown summary
+    def _finalize_summary(data: dict) -> None:
+        """Compute finalize-time derived fields and merge them into ``data``.
+
+        ``flow_trace``, ``tool_count``, ``error_count``, ``files_modified``,
+        ``files_read``, ``policy_count``, ``policy_duration``,
+        ``success_rate`` and ``source_warnings_base`` come from
+        ``flow-trace.json`` and ``tool-tracker.jsonl``, files this store does
+        not own and no concurrent writer of this session-summary store
+        touches, so they are read once above and reused across attempts.
+        Duration and the complexity average must be recomputed from ``data``
+        on every attempt: a concurrent ``session_accumulate`` call can add
+        another request between attempts, changing ``request_count``,
+        ``total_complexity`` and ``last_updated``, and a retry that reused
+        values computed before this call would finalize against a stale
+        snapshot. ``local_warnings`` is rebuilt fresh each attempt from
+        ``source_warnings_base`` rather than appended to it in place, so a
+        discarded attempt's duration warning cannot survive into the
+        winning attempt's ``data``.
+        """
+        if not data:
+            raise _NoAccumulatedDataError(session_id)
+
+        local_warnings = list(source_warnings_base)
+
+        created = data.get("created_at", "")
+        last_updated = data.get("last_updated", datetime.now().isoformat())
+        duration_human = ""
+        duration_seconds = 0
+        if created:
+            try:
+                start = datetime.fromisoformat(created)
+                end = datetime.fromisoformat(last_updated)
+                diff = end - start
+                duration_seconds = int(diff.total_seconds())
+                hours, remainder = divmod(duration_seconds, 3600)
+                minutes, secs = divmod(remainder, 60)
+                if hours > 0:
+                    duration_human = f"{hours}h {minutes}m {secs}s"
+                elif minutes > 0:
+                    duration_human = f"{minutes}m {secs}s"
+                else:
+                    duration_human = f"{secs}s"
+            except (TypeError, ValueError) as e:
+                local_warnings.append(
+                    f"Could not compute duration ({type(e).__name__}): timestamps "
+                    "are not valid ISO 8601"
+                )
+
+        req_count = data.get("request_count", 0)
+        total_complexity = data.get("total_complexity", 0)
+        avg_complexity = round(total_complexity / req_count, 1) if req_count > 0 else 0
+
+        data["status"] = "COMPLETED"
+        data["duration_human"] = duration_human
+        data["duration_seconds"] = duration_seconds
+        data["avg_complexity"] = avg_complexity
+        data["files_modified"] = sorted(files_modified)
+        data["files_read"] = sorted(files_read)
+        data["total_tool_calls"] = tool_count
+        data["error_count"] = error_count
+        data["success_rate_pct"] = success_rate
+        data["source_warnings"] = local_warnings
+
+    try:
+        data = store.modify(_finalize_summary)
+    except _NoAccumulatedDataError:
+        return {
+            "success": False,
+            "error": f"No accumulated data for {session_id}"
+        }
+
+    req_count = data.get("request_count", 0)
+    avg_complexity = data.get("avg_complexity", 0)
+    duration_human = data.get("duration_human", "")
+    source_warnings = data.get("source_warnings", [])
+
     md_lines = [
         f"# Session Summary: {session_id}",
         "",
@@ -1186,13 +1309,11 @@ def session_finalize(
         "",
     ]
 
-    # Supplementary skills
     supp = data.get("all_supplementary_skills", [])
     if supp:
         md_lines.append(f"**Supplementary Skills:** {', '.join(supp)}")
         md_lines.append("")
 
-    # Request log
     md_lines.append("## Request Log")
     md_lines.append("")
     md_lines.append("| # | Time | Type | Skill | Complexity | Model |")
@@ -1206,7 +1327,6 @@ def session_finalize(
         )
     md_lines.append("")
 
-    # Files section
     if files_modified:
         md_lines.append("## Files Modified")
         md_lines.append("")
@@ -1214,7 +1334,6 @@ def session_finalize(
             md_lines.append(f"- {f}")
         md_lines.append("")
 
-    # Pipeline decisions
     if flow_trace:
         decisions = flow_trace.get("decisions_timeline", [])
         if decisions:
@@ -1229,33 +1348,29 @@ def session_finalize(
 
     summary_md = "\n".join(md_lines)
 
-    # Save markdown summary
     session_dir = LOGS_PATH / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
     md_path = session_dir / "session-summary.md"
     md_path.write_text(summary_md, encoding="utf-8")
 
-    # Update accumulated data status
-    data["status"] = "COMPLETED"
-    data["duration_human"] = duration_human
-    data["duration_seconds"] = duration_seconds
-    data["avg_complexity"] = avg_complexity
-    data["files_modified"] = sorted(files_modified)
-    data["files_read"] = sorted(files_read)
-    data["total_tool_calls"] = tool_count
-    data["error_count"] = error_count
-    data["success_rate_pct"] = success_rate
-    data["source_warnings"] = source_warnings
-    store.save(data)
+    def _record_chain_summary(index: dict) -> None:
+        """Copy the finalized one-line summary onto the chain-index record.
 
-    # Update chain index summary
-    index = _chain_store.load()
-    if session_id in index.get("sessions", {}):
-        index["sessions"][session_id]["summary"] = (
-            f"{req_count} requests, {', '.join(data.get('skills_used', [])[:3])}, "
-            f"complexity avg {avg_complexity}"
-        )
-        _chain_store.save(index)
+        ``req_count``, ``avg_complexity`` and the skills list are read from
+        ``data``, the dict ``store.modify()`` already resolved and returned
+        above -- the winning session-summary write, not a value computed
+        before that race was settled. The membership check is redone here
+        because a session can be removed from the index between the
+        finalize write and this one; a stale check computed earlier could
+        write ``index["sessions"][session_id]`` back into existence.
+        """
+        if session_id in index.get("sessions", {}):
+            index["sessions"][session_id]["summary"] = (
+                f"{req_count} requests, {', '.join(data.get('skills_used', [])[:3])}, "
+                f"complexity avg {avg_complexity}"
+            )
+
+    _chain_store.modify(_record_chain_summary)
 
     return {
         "success": True,
@@ -1294,18 +1409,10 @@ def session_add_work_item(
         work_type: Type prefix for work item ID (e.g., 'TASK', 'WORK', 'BUG')
         metadata: JSON string of additional fields
     """
-    index = _chain_store.load()
-
-    if session_id not in index["sessions"]:
-        return {"success": False, "error": f"Session not found: {session_id}"}
-
-    session = index["sessions"][session_id]
-
-    # Generate work item ID
     suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
     work_id = f"{work_type}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{suffix}"
+    started_at = datetime.now().isoformat()
 
-    # Parse metadata
     try:
         meta = json.loads(metadata)
     except (json.JSONDecodeError, TypeError):
@@ -1315,14 +1422,30 @@ def session_add_work_item(
         "work_id": work_id,
         "type": work_type,
         "description": description,
-        "started_at": datetime.now().isoformat(),
+        "started_at": started_at,
         "completed_at": None,
         "status": "IN_PROGRESS",
         "metadata": meta
     }
 
-    session.setdefault("work_items", []).append(work_item)
-    _chain_store.save(index)
+    def _add_work_item(index: dict) -> None:
+        """Append the new work item to its session's work-item list.
+
+        ``work_id`` is returned to the caller and is later looked up by
+        ``session_complete_work_item``, so it is generated once above and
+        closed over: a work item id that changed per retry would let a
+        losing attempt's id leak into the response while a different id
+        was actually persisted. The membership check is redone here since
+        the session could be removed from the index between attempts.
+        """
+        if session_id not in index.get("sessions", {}):
+            raise _SessionNotFoundError(session_id)
+        index["sessions"][session_id].setdefault("work_items", []).append(work_item)
+
+    try:
+        _chain_store.modify(_add_work_item)
+    except _SessionNotFoundError:
+        return {"success": False, "error": f"Session not found: {session_id}"}
 
     return {
         "success": True,
@@ -1352,35 +1475,50 @@ def session_complete_work_item(
         work_id: Work item ID to complete
         status: Final status (COMPLETED, FAILED, SKIPPED)
     """
-    index = _chain_store.load()
+    def _complete_work_item(index: dict) -> None:
+        """Find the work item by id and mark it terminal in place.
 
-    if session_id not in index["sessions"]:
+        The membership and work-item lookup are redone on every attempt
+        rather than reused from a prior read: a concurrent
+        ``session_add_work_item`` call could be the one that makes the
+        target id exist. ``completed_at`` is generated inside the mutator
+        so it reflects the winning attempt's actual persist time rather
+        than a candidate time decided before the race was settled; the
+        caller reads the persisted value back from the dict this function
+        returns instead of generating a second, possibly different,
+        timestamp for the response.
+        """
+        if session_id not in index.get("sessions", {}):
+            raise _SessionNotFoundError(session_id)
+        work_items = index["sessions"][session_id].get("work_items", [])
+        for item in work_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("work_id") == work_id:
+                item["completed_at"] = datetime.now().isoformat()
+                item["status"] = status
+                return
+        raise _WorkItemNotFoundError(work_id)
+
+    try:
+        index = _chain_store.modify(_complete_work_item)
+    except _SessionNotFoundError:
         return {"success": False, "error": f"Session not found: {session_id}"}
-
-    session = index["sessions"][session_id]
-    work_items = session.get("work_items", [])
-
-    found = False
-    for item in work_items:
-        if not isinstance(item, dict):
-            continue
-        if item.get("work_id") == work_id:
-            item["completed_at"] = datetime.now().isoformat()
-            item["status"] = status
-            found = True
-            break
-
-    if not found:
+    except _WorkItemNotFoundError:
         return {"success": False, "error": f"Work item not found: {work_id}"}
 
-    _chain_store.save(index)
+    completed_item = next(
+        (item for item in index["sessions"][session_id].get("work_items", [])
+         if isinstance(item, dict) and item.get("work_id") == work_id),
+        {}
+    )
 
     return {
         "success": True,
         "work_id": work_id,
         "session_id": session_id,
         "status": status,
-        "completed_at": datetime.now().isoformat()
+        "completed_at": completed_item.get("completed_at", "")
     }
 
 
